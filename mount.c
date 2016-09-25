@@ -203,6 +203,9 @@ static bool mountInitNsInternal(struct nsjconf_t *nsjconf)
 
 	struct mounts_t *p;
 	TAILQ_FOREACH(p, &nsjconf->mountpts, pointers) {
+		if (nsjconf->pivot_root_only && strcmp(p->dst, "/") == 0) {
+			continue;
+		}
 		char dst[PATH_MAX];
 		snprintf(dst, sizeof(dst), "%s/%s", newrootdir, p->dst);
 		if (mountMount(nsjconf, p, "/old_root", dst) == false) {
