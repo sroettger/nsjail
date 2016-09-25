@@ -155,6 +155,61 @@ static bool mountRemountRO(struct mounts_t *mpt)
 	return true;
 }
 
+static bool mountInitNsInternalNoChroot(struct nsjconf_t *nsjconf) {
+	const char *const destdir = "/tmp";
+	if (mount(NULL, destdir, "tmpfs", 0, NULL) == -1) {
+		PLOG_E("mount('%s', 'tmpfs'", destdir);
+		return false;
+	}
+
+	struct mounts_t *p;
+	TAILQ_FOREACH(p, &nsjconf->mountpts, pointers) {
+		char dst[PATH_MAX];
+		snprintf(dst, sizeof(dst), "%s/%s", destdir, p->dst);
+		if (mountMount(nsjconf, p, "/", dst) == false) {
+			return false;
+		}
+	}
+
+	char oldrootdir[PATH_MAX];
+	snprintf(oldrootdir, sizeof(oldrootdir), "%s/old_root", destdir);
+	if (mkdir(oldrootdir, 0755) == -1) {
+		PLOG_E("mkdir('%s')", oldrootdir);
+		return false;
+	}
+	if (syscall(__NR_pivot_root, destdir, oldrootdir) == -1) {
+		PLOG_E("pivot_root('%s', '%s')", destdir, oldrootdir);
+		return false;
+	}
+	if (chdir("/") == -1) {
+		PLOG_E("chdir('/')");
+		return false;
+	}
+
+
+	if (umount2("/old_root", MNT_DETACH) == -1) {
+		PLOG_E("umount2('/old_root', MNT_DETACH)");
+		return false;
+	}
+	if (rmdir("/old_root") == -1) {
+		PLOG_E("rmdir('/old_root')");
+		return false;
+	}
+
+	if (chdir(nsjconf->cwd) == -1) {
+		PLOG_E("chdir('%s')", nsjconf->cwd);
+		return false;
+	}
+
+	TAILQ_FOREACH(p, &nsjconf->mountpts, pointers) {
+		if (mountRemountRO(p) == false) {
+			return false;
+		}
+	}
+
+	return true;
+
+}
 static bool mountInitNsInternal(struct nsjconf_t *nsjconf)
 {
 	if (nsjconf->clone_newns == false) {
@@ -168,6 +223,10 @@ static bool mountInitNsInternal(struct nsjconf_t *nsjconf)
 			return false;
 		}
 		return true;
+	}
+
+	if (nsjconf->pivot_root_only) {
+		return mountInitNsInternalNoChroot(nsjconf);
 	}
 
 	const char *const destdir = "/tmp";
@@ -190,15 +249,10 @@ static bool mountInitNsInternal(struct nsjconf_t *nsjconf)
 		return false;
 	}
 
-	const char *newrootdir;
-	if (nsjconf->pivot_root_only == false) {
-		newrootdir = "/new_root";
-		if (mkdir(newrootdir, 0755) == -1) {
-			PLOG_E("mkdir('%s')", newrootdir);
-			return false;
-		}
-	} else {
-		newrootdir = "/";
+	const char *newrootdir = "/new_root";
+	if (mkdir(newrootdir, 0755) == -1) {
+		PLOG_E("mkdir('%s')", newrootdir);
+		return false;
 	}
 
 	struct mounts_t *p;
@@ -214,16 +268,9 @@ static bool mountInitNsInternal(struct nsjconf_t *nsjconf)
 		PLOG_E("umount2('/old_root', MNT_DETACH)");
 		return false;
 	}
-	if (nsjconf->pivot_root_only == false) {
-		if (chroot(newrootdir) == -1) {
-			PLOG_E("chroot('%s')", newrootdir);
-			return false;
-		}
-	} else {
-		if (rmdir("/old_root") == -1) {
-			PLOG_E("rmdir('/old_root')");
-			return false;
-		}
+	if (chroot(newrootdir) == -1) {
+		PLOG_E("chroot('%s')", newrootdir);
+		return false;
 	}
 
 	if (chdir(nsjconf->cwd) == -1) {
