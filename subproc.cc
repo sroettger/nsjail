@@ -135,9 +135,6 @@ static const char kSubprocErrorChar = 'E';
 
 static void subprocNewProc(
     nsjconf_t* nsjconf, int netfd, int fd_in, int fd_out, int fd_err, int pipefd) {
-	if (!contain::setupFD(nsjconf, fd_in, fd_out, fd_err)) {
-		return;
-	}
 	if (!resetEnv()) {
 		return;
 	}
@@ -408,10 +405,12 @@ static bool initParent(nsjconf_t* nsjconf, pid_t pid, int pipefd) {
 	return true;
 }
 
+
 pid_t runChild(nsjconf_t* nsjconf, int netfd, int fd_in, int fd_out, int fd_err) {
 	if (!net::limitConns(nsjconf, netfd)) {
 		return 0;
 	}
+
 	unsigned long flags = 0UL;
 	flags |= (nsjconf->clone_newnet ? CLONE_NEWNET : 0);
 	flags |= (nsjconf->clone_newuser ? CLONE_NEWUSER : 0);
@@ -422,6 +421,14 @@ pid_t runChild(nsjconf_t* nsjconf, int netfd, int fd_in, int fd_out, int fd_err)
 	flags |= (nsjconf->clone_newcgroup ? CLONE_NEWCGROUP : 0);
 
 	if (nsjconf->mode == MODE_STANDALONE_EXECVE) {
+		if (!contain::setupFD(nsjconf, fd_in, fd_out, fd_err)) {
+			LOG_F("Setting up file descriptors failed");
+		}
+		if (!nsjconf->pre_exec.empty()) {
+			if (systemExe({nsjconf->pre_exec}, NULL) != 0) {
+				LOG_F("pre_exec not successful");
+			}
+		}
 		if (unshare(flags) == -1) {
 			PLOG_F("unshare(%s)", cloneFlagsToStr(flags).c_str());
 		}
@@ -440,6 +447,24 @@ pid_t runChild(nsjconf_t* nsjconf, int netfd, int fd_in, int fd_out, int fd_err)
 	int child_fd = sv[0];
 	int parent_fd = sv[1];
 
+	pid_t setup_pid = fork();
+	// Spawn a new process so that we don't block on pre_exec
+	if (setup_pid != 0) {
+		addProc(nsjconf, setup_pid, netfd);
+		close(parent_fd);
+		close(child_fd);
+		return setup_pid;
+	}
+
+	if (!contain::setupFD(nsjconf, fd_in, fd_out, fd_err)) {
+		LOG_F("Setting up file descriptors for pre_exec failed");
+	}
+	if (!nsjconf->pre_exec.empty()) {
+		if (systemExe({nsjconf->pre_exec}, NULL) != 0) {
+			LOG_F("pre_exec not successful");
+		}
+	}
+
 	pid_t pid = cloneProc(flags);
 	if (pid == 0) {
 		close(parent_fd);
@@ -456,32 +481,47 @@ pid_t runChild(nsjconf_t* nsjconf, int netfd, int fd_in, int fd_out, int fd_err)
 			    "supported under kernel versions >= 4.6 only. Try disabling this flag");
 			errno = saved_errno;
 		}
-		PLOG_E(
+		PLOG_F(
 		    "clone(flags=%s) failed. You probably need root privileges if your system "
 		    "doesn't support CLONE_NEWUSER. Alternatively, you might want to recompile "
 		    "your kernel with support for namespaces or check the current value of the "
 		    "kernel.unprivileged_userns_clone sysctl",
 		    cloneFlagsToStr(flags).c_str());
-		close(parent_fd);
-		return -1;
 	}
-	addProc(nsjconf, pid, netfd);
 
 	if (!initParent(nsjconf, pid, parent_fd)) {
-		close(parent_fd);
-		return -1;
+		LOG_F("initParent failed");
 	}
 
 	char rcvChar;
 	if (util::readFromFd(parent_fd, &rcvChar, sizeof(rcvChar)) == sizeof(rcvChar) &&
 	    rcvChar == kSubprocErrorChar) {
-		LOG_W("Received error message from the child process before it has been executed");
-		close(parent_fd);
-		return -1;
+		LOG_F("Received error message from the child process before it has been executed");
 	}
 
-	close(parent_fd);
-	return pid;
+	for (;;) {
+		int status;
+		int ret = wait4(pid, &status, __WALL, NULL);
+		if (ret == -1 && errno == EINTR) {
+			continue;
+		}
+		if (ret == -1) {
+			PLOG_W("wait4(pid=%d)", pid);
+			exit(1);
+		}
+		if (WIFEXITED(status)) {
+			int exit_code = WEXITSTATUS(status);
+			LOG_D("pid=%d exited with exit code: %d", pid, exit_code);
+			exit(exit_code);
+		}
+		if (WIFSIGNALED(status)) {
+			int exit_signal = WTERMSIG(status);
+			LOG_W("pid=%d killed by signal: %d (%s)", pid, exit_signal,
+			    util::sigName(exit_signal).c_str());
+			exit(2);
+		}
+		LOG_W("Unknown exit status: %d", status);
+	}
 }
 
 /*
